@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SmartNote AI</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="app" id="app">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="mark">S</div>
+      <div class="name">SmartNote<small>Asisten catatan pribadi</small></div>
+    </div>
+    <button class="new-note-btn" data-action="new-note">＋ Catatan Baru</button>
+
+    <button class="nav-item" data-view="dashboard">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+      Dashboard
+    </button>
+    <button class="nav-item" data-view="all">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h5"/></svg>
+      Semua Catatan <span class="count" id="count-all">0</span>
+    </button>
+    <button class="nav-item" data-view="favorites">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 17.3 6.2 21l1.5-6.6L2 9.9l6.7-.6L12 3l3.3 6.3 6.7.6-5.7 4.5 1.5 6.6z"/></svg>
+      Favorit <span class="count" id="count-fav">0</span>
+    </button>
+    <button class="nav-item" data-view="graph">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.3"/><circle cx="18" cy="6" r="2.3"/><circle cx="12" cy="18" r="2.3"/><path d="M7.8 7.2 16.2 6M11 16 7 8M13 16l4-8"/></svg>
+      Knowledge Graph
+    </button>
+    <button class="nav-item" data-view="trash">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m2 0-1 13a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1L6 7"/></svg>
+      Trash <span class="count" id="count-trash">0</span>
+    </button>
+
+    <div class="nav-section">Tags</div>
+    <div class="tag-nav" id="tag-nav"></div>
+
+    <div class="sidebar-footer">
+      <div class="row"><span>Catatan</span><span id="foot-count">0</span></div>
+      <div class="row"><span>Ukuran data</span><span id="foot-size">0 KB</span></div>
+      <button data-action="export">⬇ Export semua (.json)</button>
+      <button data-action="import">⬆ Import dari file</button>
+      <input type="file" id="import-input" accept="application/json" />
+      <button data-action="toggle-theme" id="theme-btn">🌙 Mode gelap</button>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn icon-btn" data-action="toggle-sidebar">☰</button>
+      <div class="search-box">
+        🔎 <input id="search-input" placeholder="Cari catatan, topik, tag, atau kata kunci..." />
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn" data-action="toggle-sidebar" title="Sidebar" style="display:none"></button>
+      </div>
+    </div>
+
+    <div class="content">
+      <div class="content-inner" id="view-root"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toast-wrap"></div>
+
+<script src="script.js"></script>
+</body>
+</html>
