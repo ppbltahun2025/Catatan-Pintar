@@ -2,18 +2,27 @@
 "use strict";
 
 /* ============================================================
-   STORAGE & STATE
+   STORAGE, SESI PENGGUNA & SINKRONISASI KE GOOGLE SHEET
    ============================================================ */
-const STORE_KEY = "smartnote_notes_v1";
+const SN = window.SN = window.SN || {};
+SN.views = SN.views || {};
 const THEME_KEY = "smartnote_theme";
+const LEGACY_KEY = "smartnote_notes_v1";
+const K = {
+  notes: u=>'sn_notes_'+u, pdel: u=>'sn_pdel_'+u, goal: u=>'sn_goal_'+u,
+  seeded: u=>'sn_seeded_'+u, goalhit: u=>'sn_goalhit_'+u, book: u=>'sn_book_'+u
+};
+SN.K = K;
 
+let USER = null;
 let notes = [];
+let snap = {};            // id -> JSON terakhir yang dikonfirmasi tersimpan di server
+let pendingDel = [];      // id yang dihapus permanen tapi belum terkonfirmasi server
+let syncTimer = null, syncing = false;
 let state = {
-  view: "dashboard",       // dashboard | all | favorites | trash | graph | tag | editor
-  search: "",
-  activeTag: null,
-  currentNoteId: null,
-  editorMode: "write"       // write | preview
+  view: "dashboard",      // dashboard | all | favorites | trash | graph | tag | editor | book | jejak
+  search: "", activeTag: null, currentNoteId: null, editorMode: "write",
+  params: {}, prev: null
 };
 
 const STOPWORDS = new Set(("yang dan di ke dari ini itu dengan untuk pada adalah akan tidak atau juga sudah belum "+
@@ -39,6 +48,10 @@ function fmtRelative(iso){
   if(d < 7) return d + " hari lalu";
   return fmtDate(iso);
 }
+function dayKey(d){
+  d = d instanceof Date ? d : new Date(d);
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
 function escapeHtml(s){
   return (s||"").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -48,83 +61,125 @@ function toast(msg){
   el.className = 'toast';
   el.textContent = msg;
   wrap.appendChild(el);
-  setTimeout(()=>{ el.style.transition='opacity .2s'; el.style.opacity='0'; setTimeout(()=>el.remove(),200); }, 2400);
+  setTimeout(()=>{ el.style.transition='opacity .2s'; el.style.opacity='0'; setTimeout(()=>el.remove(),200); }, 2600);
 }
 
-function save(){
+/* ---------- status sinkronisasi ---------- */
+const STATUS = {
+  local:   '💾 Mode lokal',
+  saved:   '☁ Tersimpan di Sheet',
+  pending: '✎ Menunggu disimpan…',
+  syncing: '⟳ Menyimpan…',
+  offline: '⚠ Offline — dicoba lagi'
+};
+function setStatus(s){
+  const p = document.getElementById('sync-pill'); if(!p) return;
+  p.dataset.s = s; p.textContent = STATUS[s] || s;
+}
+SN.setStatus = setStatus;
+
+function persistLocal(){
+  if(!USER) return;
   try{
-    localStorage.setItem(STORE_KEY, JSON.stringify(notes));
-  }catch(e){ toast("Gagal menyimpan ke penyimpanan lokal browser."); }
-  renderSidebarMeta();
+    localStorage.setItem(K.notes(USER.username), JSON.stringify(notes));
+    localStorage.setItem(K.pdel(USER.username), JSON.stringify(pendingDel));
+  }catch(e){ toast("Penyimpanan lokal browser penuh."); }
 }
+function save(){
+  persistLocal(); renderSidebarMeta(); scheduleSync();
+}
+function scheduleSync(delay){
+  if(!USER) return;
+  if(!SN.backend || !SN.backend.remote){ setStatus('local'); return; }
+  setStatus('pending');
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(doSync, delay == null ? 1600 : delay);
+}
+async function doSync(){
+  if(!USER || !SN.backend.remote) return;
+  if(syncing){ scheduleSync(900); return; }
+  const sent = [];
+  notes.forEach(n=>{ const s = JSON.stringify(n); if(snap[n.id] !== s) sent.push([n, s]); });
+  const removed = pendingDel.slice();
+  if(!sent.length && !removed.length){ setStatus('saved'); return; }
+  syncing = true; setStatus('syncing');
+  try{
+    const res = await SN.backend.sync({upsert: sent.map(x=>x[0]), remove: removed});
+    sent.forEach(([n,s])=>{ snap[n.id] = s; });
+    (res.rejected||[]).forEach(id=>{ const n = getNote(id); if(n) snap[id] = JSON.stringify(n); toast("Satu catatan terlalu besar untuk disimpan ke Sheet."); });
+    pendingDel = pendingDel.filter(id=>!removed.includes(id));
+    (res.newer||[]).forEach(sn=>{
+      const i = notes.findIndex(n=>n.id===sn.id); if(i>=0) notes[i] = sn; snap[sn.id] = JSON.stringify(sn);
+    });
+    persistLocal(); renderSidebarMeta();
+    if(res.newer && res.newer.length && state.view !== 'editor') render();
+    const dirty = notes.some(n=>snap[n.id] !== JSON.stringify(n)) || pendingDel.length;
+    if(dirty) scheduleSync(700); else setStatus('saved');
+  }catch(e){
+    if(e.code === 'AUTH'){ SN.auth.forceLogout(e.message); }
+    else { setStatus('offline'); clearTimeout(syncTimer); syncTimer = setTimeout(doSync, 15000); }
+  }finally{ syncing = false; }
+}
+SN.pendingCount = ()=> notes.filter(n=>snap[n.id] !== JSON.stringify(n)).length + pendingDel.length;
 
-function load(){
-  let raw = null;
-  try{ raw = localStorage.getItem(STORE_KEY); }catch(e){}
-  if(raw){
-    try{ notes = JSON.parse(raw); return; }catch(e){}
-  }
-  notes = seedData();
-  save();
+/* gabungkan cache lokal dengan data server: versi terbaru (updatedAt) menang */
+function mergeNotes(local, server){
+  const srv = (server && server.notes) || [];
+  const gone = new Set((server && server.deletedIds) || []);
+  if(server){ snap = {}; srv.forEach(n=>{ snap[n.id] = JSON.stringify(n); }); }
+  const map = new Map();
+  srv.forEach(n=>map.set(n.id, n));
+  local.forEach(n=>{
+    if(!n || !n.id || pendingDel.includes(n.id) || gone.has(n.id)) return;
+    const s = map.get(n.id);
+    if(!s || new Date(n.updatedAt) > new Date(s.updatedAt)) map.set(n.id, n);
+  });
+  return Array.from(map.values());
 }
+SN.applyServer = function(server){
+  if(!server) return;
+  notes = mergeNotes(notes, server);
+  notes.forEach(n=>{ if(n.wc==null) n.wc = countWords(n.content); if(!n.history) n.history = []; });
+  persistLocal();
+  if(state.view === 'editor') renderSidebar(); else render();
+  scheduleSync(500);
+};
 
 /* ============================================================
-   SEED DATA
+   CATATAN CONTOH (hanya untuk akun baru)
    ============================================================ */
 function seedData(){
   const t = nowISO();
   function mk(o){
     return Object.assign({
-      id: uid(), category:"Umum", priority:"Sedang", status:"Berjalan",
+      id: uid(), category:"Umum", priority:"Sedang", status:"Baru",
       favorite:false, pinned:false, archived:false, trashed:false,
-      createdAt:t, updatedAt:t, analysis:null,
-      links:[], history:[{at:t, action:"Catatan dibuat"}]
-    }, o);
+      createdAt:t, updatedAt:t, analysis:null, links:[],
+      history:[{at:t, kind:'create', action:"Catatan dibuat"}]
+    }, o, {wc:0});
   }
-  return [
+  const list = [
     mk({
-      title:"Rapat Koordinasi Pengadaan",
-      category:"Rapat", priority:"Tinggi", tags:["pengadaan","spse","tender","pemerintah"],
-      content:"# Rapat Koordinasi Pengadaan 2026\n\nRapat membahas evaluasi proses pengadaan barang/jasa tahun 2026, "+
-        "dengan fokus pada tahapan tender melalui SPSE, evaluasi dokumen administrasi, serta kendala anggaran di beberapa unit kerja.\n\n"+
-        "## Permasalahan\n- Beberapa dokumen kontrak belum lengkap\n- Verifikasi anggaran belum selesai untuk paket 03\n"+
-        "- Risiko keterlambatan tender jika dokumen tidak segera diperbaiki\n\n"+
-        "## Rencana Tindak Lanjut\n- [ ] Periksa dokumen kontrak paket 03\n- [ ] Hubungi tim pengadaan terkait jadwal ulang tender\n"+
-        "- [ ] Verifikasi data anggaran sebelum 25 September\n- [ ] Kirim laporan evaluasi ke kepala dinas\n\n"+
-        "Catatan: prosedur mengacu pada portal INAPROC dan SPSE daerah. https://inaproc.id"
+      title:"Selamat datang di Catatan Pintar ✒",
+      category:"Umum", priority:"Sedang", tags:["panduan"], favorite:true,
+      content:"# Selamat datang!\n\nCatatanmu sekarang tersimpan di akunmu dan ikut ke perangkat mana pun.\n\n"+
+        "## Yang bisa kamu lakukan\n- Tulis bebas dengan **tebal**, *miring*, daftar, dan checklist\n"+
+        "- Buka **Buku Besar** untuk membaca semua catatan seperti halaman buku, lengkap dengan daftar halaman\n"+
+        "- Buka **Jejak** untuk melihat kapan setiap tulisan dibuat atau diperbarui, dalam rentang waktu pilihanmu\n"+
+        "- Tekan **Analyze with AI** di dalam catatan untuk ringkasan otomatis\n\n"+
+        "## Mulai dari sini\n- [ ] Tulis catatan pertamamu\n- [ ] Coba buka Buku Besar\n- [ ] Lihat Jejak tulisanmu hari ini\n\n"+
+        "> Tahan klik dan seret mouse untuk mencoret-coret dengan tinta. Percayalah, menyenangkan."
     }),
     mk({
-      title:"Ide Pengembangan Sistem Dashboard",
-      category:"Ide", priority:"Sedang", tags:["dashboard","apps-script","ide"],
-      content:"# Ide Pengembangan\n\nMemikirkan penambahan fitur distribusi operator pada dashboard permohonan agar "+
-        "lebih mudah dipantau per wilayah.\n\n## Catatan Penting\nData operator saat ini masih diinput manual, perlu "+
-        "verifikasi ulang sebelum digunakan untuk laporan resmi.\n\n- [ ] Rancang struktur tabel distribusi operator\n"+
-        "- [ ] Diskusikan dengan tim terkait kebutuhan filter wilayah"
-    }),
-    mk({
-      title:"Evaluasi Pekerjaan Triwulan",
-      category:"Pekerjaan", priority:"Tinggi", tags:["evaluasi","laporan","pekerjaan"],
-      content:"# Evaluasi Pekerjaan\n\nSecara umum progres pekerjaan triwulan ini berjalan sesuai rencana, meskipun "+
-        "ada beberapa target yang tertunda karena keterbatasan sumber daya.\n\n## Perlu Diperhatikan\n"+
-        "Deadline penyelesaian laporan akhir jatuh pada akhir bulan, sementara dua item masih menunggu data dari tim lain.\n\n"+
-        "- [ ] Susun draf laporan akhir\n- [x] Kumpulkan data capaian bulan pertama\n- [ ] Minta data dari tim keuangan"
-    }),
-    mk({
-      title:"Materi Belajar: Dasar SQL",
-      category:"Belajar", priority:"Rendah", tags:["belajar","sql","database"],
-      content:"# Dasar SQL\n\nCatatan ringkas mempelajari perintah dasar SQL seperti SELECT, WHERE, JOIN, dan GROUP BY "+
-        "untuk kebutuhan analisis data sederhana.\n\n## Poin Penting\nBelum sempat mencoba JOIN bertingkat, perlu latihan "+
-        "lebih lanjut dengan data contoh yang lebih kompleks.\n\n- [ ] Latihan query JOIN dua tabel\n- [ ] Baca ulang materi GROUP BY"
-    }),
-    mk({
-      title:"Rencana Proyek Q4",
-      category:"Proyek", priority:"Tinggi", tags:["proyek","perencanaan","q4"],
-      content:"# Rencana Proyek Kuartal 4\n\nMenyusun rencana kerja kuartal terakhir tahun ini, termasuk pembagian "+
-        "tugas tim dan target penyelesaian modul utama.\n\n## Risiko\nAda ketergantungan dengan pekerjaan tim lain yang "+
-        "jadwalnya belum pasti, berpotensi menggeser target penyelesaian.\n\n- [ ] Finalisasi timeline proyek\n"+
-        "- [ ] Koordinasi dengan tim terkait ketergantungan modul\n- [ ] Kirim rencana ke pemangku kepentingan sebelum 30 September"
-    }),
+      title:"Contoh: Rencana Mingguan",
+      category:"Pekerjaan", priority:"Tinggi", tags:["rencana","contoh"],
+      content:"# Rencana Minggu Ini\n\nTarget utama minggu ini adalah menyelesaikan laporan dan merapikan arsip.\n\n"+
+        "## Perlu Diperhatikan\nDeadline laporan jatuh pada hari Jumat, jadi data harus lengkap sebelum Kamis.\n\n"+
+        "- [ ] Susun draf laporan\n- [ ] Kumpulkan data pendukung\n- [x] Buat daftar prioritas"
+    })
   ];
+  list.forEach(n=>{ n.wc = countWords(n.content); });
+  return list;
 }
 
 /* ============================================================
@@ -347,83 +402,252 @@ function renderSidebarMeta(){
 }
 
 /* ============================================================
+   AKTIVITAS / JEJAK (dihitung dari riwayat setiap catatan)
+   ============================================================ */
+function countWords(text){ return plainText(text).split(/\s+/).filter(Boolean).length; }
+function activityMap(){
+  const m = {};
+  notes.forEach(n=>(n.history||[]).forEach(h=>{
+    const k = dayKey(h.at);
+    const o = m[k] || (m[k] = {words:0, events:0});
+    o.events++;
+    if(h.kind === 'edit') o.words += Math.max(0, (h.to||0) - (h.from||0));
+  }));
+  return m;
+}
+function streakDays(m){
+  const d = new Date();
+  if(!(m[dayKey(d)] && m[dayKey(d)].events)) d.setDate(d.getDate()-1);
+  let s = 0;
+  while(m[dayKey(d)] && m[dayKey(d)].events){ s++; d.setDate(d.getDate()-1); }
+  return s;
+}
+function getGoal(){
+  const v = parseInt((USER && localStorage.getItem(K.goal(USER.username))) || '200', 10);
+  return v > 0 ? v : 200;
+}
+function heatmapHtml(weeks, sel){
+  const m = activityMap();
+  const today = new Date(); today.setHours(0,0,0,0);
+  const dow = (today.getDay()+6)%7;
+  const start = new Date(today); start.setDate(start.getDate() - dow - (weeks-1)*7);
+  const months = ['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agu','Sep','Okt','Nov','Des'];
+  let cells = '', labels = '', lastMonth = -1;
+  for(let w=0; w<weeks; w++){
+    const wd = new Date(start); wd.setDate(start.getDate()+w*7);
+    if(wd.getMonth() !== lastMonth){ labels += `<span style="grid-column:${w+1}">${months[wd.getMonth()]}</span>`; lastMonth = wd.getMonth(); }
+    for(let d=0; d<7; d++){
+      const dt = new Date(start); dt.setDate(start.getDate()+w*7+d);
+      if(dt > today){ cells += '<i class="hm off"></i>'; continue; }
+      const k = dayKey(dt), a = m[k];
+      const lv = !a ? 0 : a.words>=400 ? 4 : a.words>=150 ? 3 : a.words>=40 ? 2 : 1;
+      const inSel = sel && sel.from && k>=sel.from && k<=sel.to;
+      const tip = dt.toLocaleDateString('id-ID',{day:'numeric',month:'short',year:'numeric'}) + ': ' +
+        (a ? a.words+' kata ditulis, '+a.events+' aktivitas' : 'tidak ada aktivitas');
+      cells += `<i class="hm l${lv}${inSel?' sel':''}" data-day="${k}" style="--d:${(w*7+d)*2}ms" title="${tip}"></i>`;
+    }
+  }
+  return `<div class="hm-wrap"><div class="hm-months" style="grid-template-columns:repeat(${weeks},13px)">${labels}</div>`+
+         `<div class="hm-grid" style="grid-template-columns:repeat(${weeks},13px)">${cells}</div></div>`;
+}
+
+let lastGoalCheck = 0;
+function checkGoal(){
+  const t = Date.now(); if(t - lastGoalCheck < 1500) return; lastGoalCheck = t;
+  const m = activityMap(), k = dayKey(new Date());
+  const w = m[k] ? m[k].words : 0, goal = getGoal();
+  if(w >= goal){
+    let hit = null; try{ hit = localStorage.getItem(K.goalhit(USER.username)); }catch(e){}
+    if(hit !== k){
+      try{ localStorage.setItem(K.goalhit(USER.username), k); }catch(e){}
+      SN.fx.confetti(); SN.fx.ding(); toast("Target menulis hari ini tercapai! 🎉 ("+goal+" kata)");
+    }
+  }
+}
+
+function openTasks(){
+  const out = [];
+  activeNotes().forEach(n=>{
+    (n.content||'').split('\n').forEach((l,i)=>{
+      const m = l.match(/^\s*[-*]\s\[ \]\s(.*)$/);
+      if(m && m[1].trim()) out.push({note:n, line:i, text:m[1].trim()});
+    });
+  });
+  return out;
+}
+
+const QUOTES = [
+  "Pikiran yang tidak ditulis mudah menguap; tinta menahannya tetap di tempat.",
+  "Satu kalimat hari ini lebih berharga daripada bab sempurna yang tak pernah dimulai.",
+  "Catatan kecil yang rajin lebih kuat daripada ingatan besar yang lupa.",
+  "Menulislah untuk mengerti, bukan hanya untuk mengingat.",
+  "Halaman kosong bukan musuh; ia hanya menunggu giliran.",
+  "Jejak yang konsisten lebih jauh jangkauannya daripada loncatan sesekali.",
+  "Tulis apa yang kamu tahu, lalu temukan apa yang belum kamu tahu.",
+  "Ide yang dicatat hari ini adalah bahan bakar proyek bulan depan.",
+  "Rapikan pikiran di atas kertas, maka kepala punya ruang untuk hal baru.",
+  "Setiap catatan adalah surat untuk dirimu di masa depan.",
+  "Tidak ada tulisan jelek di draf pertama, hanya tulisan yang belum selesai.",
+  "Kebiasaan menulis dibangun satu paragraf demi satu paragraf."
+];
+
+/* ============================================================
    RENDER: ROOT VIEW SWITCH
    ============================================================ */
+let lastViewKey = null;
 function render(){
   renderSidebar();
   const root = document.getElementById('view-root');
+  const key = state.view + '|' + (state.activeTag||'') + '|' + (state.currentNoteId||'');
+  const entering = key !== lastViewKey; lastViewKey = key;
+  document.body.dataset.view = state.view;
+  if(state.view !== 'editor'){ document.body.classList.remove('focus'); }
+
   if(state.view === 'editor' && state.currentNoteId){
     root.innerHTML = renderEditorView(getNote(state.currentNoteId));
     bindEditorEvents();
-    return;
-  }
-  if(state.view === 'graph'){
-    root.innerHTML = renderGraphView();
-    bindGraphEvents();
-    return;
-  }
-  if(state.view === 'trash'){
+  } else if(SN.views[state.view]){
+    root.innerHTML = '';
+    SN.views[state.view].render(root, state.params || {});
+  } else if(state.view === 'graph'){
+    root.innerHTML = renderGraphView(); bindGraphEvents();
+  } else if(state.view === 'trash'){
     root.innerHTML = renderListView(notes.filter(n=>n.trashed), "Trash", "Catatan yang dihapus akan tersimpan di sini sampai dihapus permanen.");
     bindListEvents();
-    return;
-  }
-  if(state.activeTag){
+  } else if(state.activeTag){
     const list = activeNotes().filter(n=>(n.tags||[]).includes(state.activeTag));
     root.innerHTML = renderListView(list, "#"+state.activeTag, "Tidak ada catatan dengan tag ini.");
     bindListEvents();
-    return;
-  }
-  if(state.view === 'favorites'){
+  } else if(state.view === 'favorites'){
     root.innerHTML = renderListView(activeNotes().filter(n=>n.favorite), "Favorit", "Belum ada catatan favorit. Tandai bintang pada sebuah catatan untuk menyimpannya di sini.");
     bindListEvents();
-    return;
-  }
-  if(state.view === 'all'){
+  } else if(state.view === 'all'){
     root.innerHTML = renderListView(activeNotes(), "Semua Catatan", "Belum ada catatan.");
     bindListEvents();
-    return;
+  } else {
+    root.innerHTML = renderDashboard();
+    bindListEvents(); bindDashboardEvents(); bindDashboardExtras(root);
   }
-  root.innerHTML = renderDashboard();
-  bindListEvents();
-  bindDashboardEvents();
+  if(entering){
+    root.classList.remove('view-enter'); void root.offsetWidth; root.classList.add('view-enter');
+    document.getElementById('content').scrollTop = 0;
+  }
+  bindTilt(root);
 }
 
 /* ---------- Dashboard ---------- */
 function renderDashboard(){
   const list = searchFilter(activeNotes());
   const recent = [...list].sort((a,b)=>new Date(b.updatedAt)-new Date(a.updatedAt)).slice(0,6);
-  const weekAgo = Date.now() - 7*86400000;
-  const thisWeek = activeNotes().filter(n=>new Date(n.createdAt).getTime() >= weekAgo).length;
-  const tagCounts = {};
-  activeNotes().forEach(n=>(n.tags||[]).forEach(t=>tagCounts[t]=(tagCounts[t]||0)+1));
-  const topTag = Object.entries(tagCounts).sort((a,b)=>b[1]-a[1])[0];
-  const catCounts = {};
-  activeNotes().forEach(n=>catCounts[n.category]=(catCounts[n.category]||0)+1);
-  const topCat = Object.entries(catCounts).sort((a,b)=>b[1]-a[1])[0];
-  const linkedPairs = activeNotes().reduce((sum,n)=>sum + relatedNotes(n).length, 0)/2;
+  const m = activityMap(), tk = dayKey(new Date());
+  const wToday = m[tk] ? m[tk].words : 0, goal = getGoal();
+  const pct = Math.min(1, wToday/goal);
+  const totalWords = activeNotes().reduce((s,n)=>s+(n.wc||0),0);
+  const tasks = openTasks();
+  const streak = streakDays(m);
+  const hr = new Date().getHours();
+  const greet = hr<11 ? 'Selamat pagi' : hr<15 ? 'Selamat siang' : hr<19 ? 'Selamat sore' : 'Selamat malam';
+  const q = QUOTES[Math.floor(Date.now()/86400000) % QUOTES.length];
+  const C = 226.2;
 
   return `
-    <div class="welcome">
-      <h1>Selamat datang kembali 👋</h1>
-      <p>Apa yang sedang ingin Anda catat hari ini?</p>
-      <div class="quick-capture">
-        <input id="quick-input" placeholder="Tulis cepat lalu tekan Enter untuk membuat catatan..." />
-        <button data-action="quick-create">＋ Buat Catatan Baru</button>
+    <div class="hero">
+      <div class="hero-text">
+        <h1 class="hand-title"><span class="reveal-ink">${greet}, ${escapeHtml(USER.name)}</span></h1>
+        <p class="quote">“${escapeHtml(q)}”</p>
+        <div class="quick-capture">
+          <input id="quick-input" placeholder="Tulis cepat lalu tekan Enter untuk membuat catatan..." />
+          <button data-action="quick-create">＋ Tulis</button>
+        </div>
+      </div>
+      <div class="goal-card" data-action="edit-goal" title="Klik untuk mengubah target harian">
+        <svg viewBox="0 0 84 84" width="104" height="104">
+          <circle cx="42" cy="42" r="36" class="ring-bg"/>
+          <circle cx="42" cy="42" r="36" class="ring-fg" stroke-dasharray="${C}" stroke-dashoffset="${C}" data-to="${(C*(1-pct)).toFixed(1)}" transform="rotate(-90 42 42)"/>
+          <text x="42" y="40" text-anchor="middle" class="ring-num">${wToday}</text>
+          <text x="42" y="54" text-anchor="middle" class="ring-sub">/ ${goal} kata</text>
+        </svg>
+        <div class="goal-label">Target hari ini ${pct>=1?'✓':''}</div>
       </div>
     </div>
 
-    <div class="section-head"><h2>Knowledge Overview</h2></div>
     <div class="stat-grid">
-      <div class="stat-card"><div class="num">${activeNotes().length}</div><div class="label">Total catatan</div></div>
-      <div class="stat-card"><div class="num">${thisWeek}</div><div class="label">Catatan minggu ini</div></div>
-      <div class="stat-card"><div class="num">${topCat ? escapeHtml(topCat[0]) : '—'}</div><div class="label">Topik paling sering</div></div>
-      <div class="stat-card"><div class="num">${topTag ? '#'+escapeHtml(topTag[0]) : '—'}</div><div class="label">Tag paling banyak dipakai</div></div>
+      <div class="stat-card"><div class="num" data-count="${activeNotes().length}">0</div><div class="label">Total catatan</div></div>
+      <div class="stat-card"><div class="num" data-count="${totalWords}">0</div><div class="label">Kata tertulis</div></div>
+      <div class="stat-card"><div class="num"><span data-count="${streak}">0</span><small> hari</small></div><div class="label">Beruntun menulis 🔥</div></div>
+      <div class="stat-card"><div class="num" data-count="${tasks.length}">0</div><div class="label">Tugas terbuka</div></div>
     </div>
 
-    <div class="section-head"><h2>Catatan Terbaru</h2>${list.length>6 ? '<button class="link" data-action="goto-all">Lihat semua →</button>':''}</div>
-    ${recent.length ? `<div class="note-grid">${recent.map(noteCardHtml).join('')}</div>` :
-      `<div class="empty-state">Belum ada catatan yang cocok.<br><button class="new-note-btn" style="display:inline-flex; margin-top:12px;" data-action="new-note">＋ Buat catatan pertama</button></div>`}
+    <div class="dash-cols">
+      <div class="dash-main">
+        <div class="section-head"><h2>Jejak 26 minggu terakhir</h2><button class="link" data-action="goto-jejak">Buka Jejak →</button></div>
+        <div class="panel pad">${heatmapHtml(26)}
+          <div class="hm-legend">Sedikit <i class="hm l0"></i><i class="hm l1"></i><i class="hm l2"></i><i class="hm l3"></i><i class="hm l4"></i> Banyak · klik kotak untuk melihat hari itu</div>
+        </div>
+
+        <div class="section-head"><h2>Catatan Terbaru</h2>${list.length>6 ? '<button class="link" data-action="goto-all">Lihat semua →</button>':''}</div>
+        ${recent.length ? `<div class="note-grid">${recent.map(noteCardHtml).join('')}</div>` :
+          `<div class="empty-state">Belum ada catatan yang cocok.<br><button class="new-note-btn" style="display:inline-flex; margin-top:12px;" data-action="new-note">＋ Buat catatan pertama</button></div>`}
+      </div>
+
+      <div class="dash-side">
+        <div class="section-head"><h2>Tugas Terbuka</h2></div>
+        <div class="panel pad tasks">
+          ${tasks.length ? tasks.slice(0,8).map(t=>`
+            <label class="task-row">
+              <input type="checkbox" data-action="dash-task" data-id="${t.note.id}" data-line="${t.line}" />
+              <span class="t-text">${escapeHtml(t.text)}</span>
+              <a class="from" data-action="open-note" data-id="${t.note.id}">${escapeHtml((t.note.title||'Tanpa judul').slice(0,22))}</a>
+            </label>`).join('') + (tasks.length>8 ? `<div class="hint">+${tasks.length-8} tugas lainnya</div>`:'')
+            : '<div class="verify-note">Semua beres. Tambahkan baris “- [ ] tugas” di catatan mana pun.</div>'}
+        </div>
+      </div>
+    </div>
   `;
+}
+
+function bindDashboardExtras(root){
+  // cincin target
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    root.querySelectorAll('.ring-fg').forEach(c=>{ c.style.strokeDashoffset = c.dataset.to; });
+  }));
+  // hitung naik
+  root.querySelectorAll('[data-count]').forEach(el=>{
+    const to = parseInt(el.dataset.count,10) || 0; const t0 = performance.now(); const dur = 900;
+    (function step(t){
+      const p = Math.min(1,(t-t0)/dur), e = 1-Math.pow(1-p,3);
+      el.textContent = Math.round(to*e).toLocaleString('id-ID');
+      if(p<1) requestAnimationFrame(step);
+    })(t0);
+  });
+  root.querySelectorAll('.hm[data-day]').forEach(c=>c.onclick = ()=>SN.go('jejak',{from:c.dataset.day,to:c.dataset.day}));
+  const gj = root.querySelector('[data-action="goto-jejak"]'); if(gj) gj.onclick = ()=>SN.go('jejak',{});
+  const eg = root.querySelector('[data-action="edit-goal"]');
+  if(eg) eg.onclick = ()=>promptModal("Target menulis harian","Berapa kata yang ingin kamu tulis setiap hari?",String(getGoal()),v=>{
+    const n = parseInt(v,10); if(!(n>0)) return toast("Masukkan angka lebih dari 0.");
+    try{ localStorage.setItem(K.goal(USER.username), String(Math.min(n,20000))); }catch(e){}
+    render();
+  });
+  root.querySelectorAll('[data-action="dash-task"]').forEach(cb=>{
+    cb.onchange = ()=>{
+      const row = cb.closest('.task-row'); row.classList.add('done');
+      toggleTaskLine(cb.dataset.id, parseInt(cb.dataset.line,10), cb.checked);
+      setTimeout(render, 550);
+    };
+  });
+}
+
+/* efek miring kartu mengikuti kursor */
+function bindTilt(root){
+  if(!window.matchMedia('(hover:hover) and (pointer:fine)').matches) return;
+  root.querySelectorAll('.note-card').forEach(c=>{
+    c.addEventListener('mousemove', e=>{
+      const r = c.getBoundingClientRect();
+      const x = (e.clientX-r.left)/r.width-.5, y = (e.clientY-r.top)/r.height-.5;
+      c.style.transform = `perspective(700px) rotateX(${(-y*5).toFixed(2)}deg) rotateY(${(x*6).toFixed(2)}deg) translateY(-2px)`;
+    });
+    c.addEventListener('mouseleave', ()=>{ c.style.transform=''; });
+  });
 }
 
 /* ---------- Generic list view ---------- */
@@ -448,11 +672,11 @@ function renderListView(list, title, emptyMsg){
   `;
 }
 
-function noteCardHtml(n){
+function noteCardHtml(n,i){
   const preview = plainText(n.content).slice(0,140) || 'Catatan kosong.';
   const tags = (n.tags||[]).slice(0,3).map(t=>`<span class="tag-chip">#${escapeHtml(t)}</span>`).join('');
   return `
-    <div class="note-card" data-action="open-note" data-id="${n.id}">
+    <div class="note-card rise" style="--i:${Math.min(i||0,12)}" data-action="open-note" data-id="${n.id}">
       <div class="top-row">
         <h3>${escapeHtml(n.title || 'Tanpa judul')}</h3>
         <div class="pin-fav">
@@ -519,13 +743,15 @@ function createNote(initialText){
     category:"Umum", priority:"Sedang", status:"Baru",
     tags:[], favorite:false, pinned:false, archived:false, trashed:false,
     createdAt: nowISO(), updatedAt: nowISO(), analysis:null, links:[],
-    history:[{at:nowISO(), action:"Catatan dibuat"}]
+    wc: countWords(initialText||""),
+    history:[{at:nowISO(), kind:"create", action:"Catatan dibuat"}]
   };
   notes.unshift(note);
   save();
   return note;
 }
 function openNote(id){
+  if(state.view !== 'editor') state.prev = {view:state.view, tag:state.activeTag, params:state.params};
   state.view = 'editor'; state.currentNoteId = id; state.editorMode='write'; state.activeTag=null;
   render();
 }
@@ -564,6 +790,7 @@ function renderEditorView(note){
             <input id="tag-input" placeholder="+ tag" />
           </div>
           <span class="meta-field updated">Diperbarui ${fmtRelative(note.updatedAt)}</span>
+          <button class="icon-btn pill-btn" data-action="focus-mode">⛶ Mode fokus</button>
           <button class="icon-btn" style="width:auto; padding:0 10px; height:28px; border-radius:20px; font-size:12px;" data-action="toggle-fav-editor">${note.favorite?'★ Favorit':'☆ Favorit'}</button>
           <button class="icon-btn" style="width:auto; padding:0 10px; height:28px; border-radius:20px; font-size:12px;" data-action="toggle-pin-editor">${note.pinned?'📌 Pinned':'📌 Pin'}</button>
           <button class="icon-btn" style="width:auto; padding:0 10px; height:28px; border-radius:20px; font-size:12px; color:var(--red);" data-action="delete-note">🗑 ${note.trashed?'Hapus permanen':'Hapus'}</button>
@@ -591,6 +818,7 @@ function renderEditorView(note){
         ${state.editorMode==='write'
           ? `<textarea id="content-textarea" placeholder="Tulis bebas di sini... gunakan **tebal**, *miring*, - untuk daftar, - [ ] untuk checklist, > untuk kutipan.">${escapeHtml(note.content)}</textarea>`
           : `<div id="content-preview">${mdToHtml(note.content, note.id)}</div>`}
+        <div class="editor-foot"><span id="wc"></span><span class="sep">·</span><span id="chars"></span><span class="grow"></span><span class="goal-mini"><i id="goal-fill"></i></span><span id="goal-txt"></span></div>
       </div>
 
       <div class="insights">
@@ -683,17 +911,14 @@ function renderRelated(related){
     </div>
   `).join('');
 }
-function renderHistory(note){
-  const h = (note.history||[]).slice().reverse();
-  return h.map(e=>`<div style="margin-bottom:6px;"><strong style="font-size:11.5px; color:var(--ink);">${fmtDate(e.at)}</strong><br>${escapeHtml(e.action)}</div>`).join('') || '<span class="verify-note">Belum ada riwayat</span>';
-}
-
 /* ---------- Editor event binding ---------- */
 function bindEditorEvents(){
   const note = getNote(state.currentNoteId);
   if(!note) return;
 
-  document.querySelector('[data-action="back"]').onclick = ()=>{ state.view='all'; state.currentNoteId=null; render(); };
+  document.querySelector('[data-action="back"]').onclick = goBack;
+  document.querySelector('[data-action="focus-mode"]').onclick = ()=>{ document.body.classList.toggle('focus'); };
+  updateEditorFoot(note);
 
   const titleInput = document.getElementById('title-input');
   titleInput.addEventListener('input', ()=>{ note.title = titleInput.value; touchNote(note); save(); renderSidebar(); });
@@ -702,9 +927,9 @@ function bindEditorEvents(){
   if(contentArea){
     contentArea.addEventListener('input', ()=>{
       note.content = contentArea.value;
-      touchNote(note);
-      save();
+      onContentChanged(note);
     });
+    contentArea.addEventListener('keydown', ()=>SN.fx.tick());
   }
 
   document.getElementById('meta-category').onchange = e=>{ note.category=e.target.value; touchNote(note); save(); };
@@ -731,6 +956,7 @@ function bindEditorEvents(){
     if(note.trashed){
       confirmModal("Hapus permanen?", "Catatan ini akan dihapus selamanya dan tidak dapat dikembalikan.", ()=>{
         notes = notes.filter(n=>n.id!==note.id);
+        delete snap[note.id]; pendingDel.push(note.id);
         save(); state.view='trash'; state.currentNoteId=null; render();
       });
     } else {
@@ -752,7 +978,7 @@ function bindEditorEvents(){
     const s = contentArea.selectionStart, e = contentArea.selectionEnd;
     const val = contentArea.value;
     contentArea.value = val.slice(0,s) + pre + val.slice(s,e) + post + val.slice(e);
-    note.content = contentArea.value; touchNote(note); save();
+    note.content = contentArea.value; onContentChanged(note);
     contentArea.focus(); contentArea.selectionStart = s+pre.length; contentArea.selectionEnd = e+pre.length;
   }
   function prefixLine(prefix){
@@ -761,7 +987,7 @@ function bindEditorEvents(){
     const val = contentArea.value;
     const lineStart = val.lastIndexOf('\n', s-1)+1;
     contentArea.value = val.slice(0,lineStart) + prefix + val.slice(lineStart);
-    note.content = contentArea.value; touchNote(note); save();
+    note.content = contentArea.value; onContentChanged(note);
     contentArea.focus(); contentArea.selectionStart = contentArea.selectionEnd = s+prefix.length;
   }
   function insertBlock(text){
@@ -769,7 +995,7 @@ function bindEditorEvents(){
     const s = contentArea.selectionStart;
     const val = contentArea.value;
     contentArea.value = val.slice(0,s) + text + val.slice(s);
-    note.content = contentArea.value; touchNote(note); save();
+    note.content = contentArea.value; onContentChanged(note);
     contentArea.focus();
   }
 
@@ -800,13 +1026,8 @@ function bindEditorEvents(){
   // action items
   document.querySelectorAll('[data-action="toggle-action"]').forEach(cb=>{
     cb.onchange = ()=>{
-      const n = getNote(cb.dataset.id);
-      const lines = n.content.split('\n');
-      const idx = parseInt(cb.dataset.line,10);
-      lines[idx] = lines[idx].replace(/\[( |x|X)\]/, cb.checked ? '[x]' : '[ ]');
-      n.content = lines.join('\n');
-      touchNote(n); save();
-      if(document.getElementById('content-textarea')) document.getElementById('content-textarea').value = n.content;
+      toggleTaskLine(cb.dataset.id, parseInt(cb.dataset.line,10), cb.checked);
+      const ta = document.getElementById('content-textarea'); if(ta) ta.value = getNote(cb.dataset.id).content;
     };
   });
   const addActionBtn = document.querySelector('[data-action="add-action"]');
@@ -815,19 +1036,14 @@ function bindEditorEvents(){
       const input = document.getElementById('new-action-input');
       if(!input.value.trim()) return;
       note.content += (note.content.endsWith('\n') || !note.content ? '' : '\n') + '- [ ] ' + input.value.trim();
-      touchNote(note); save(); render();
+      onContentChanged(note); render();
     };
   }
 
   // links
   document.querySelectorAll('[data-action="toggle-checkline"]').forEach(cb=>{
     cb.onchange = ()=>{
-      const n = getNote(cb.dataset.note);
-      const lines = n.content.split('\n');
-      const idx = parseInt(cb.dataset.line,10);
-      lines[idx] = lines[idx].replace(/\[( |x|X)\]/, cb.checked ? '[x]' : '[ ]');
-      n.content = lines.join('\n');
-      touchNote(n); save(); render();
+      toggleTaskLine(cb.dataset.note, parseInt(cb.dataset.line,10), cb.checked); render();
     };
   });
   const addLinkBtn = document.querySelector('[data-action="add-link"]');
@@ -898,12 +1114,12 @@ function bindGraphEvents(){
    truly persist when the person downloads them)
    ============================================================ */
 function exportAll(){
-  const payload = { app:"SmartNote AI", exportedAt: nowISO(), notes };
+  const payload = { app:"Catatan Pintar", exportedAt: nowISO(), notes };
   const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'smartnote-export-' + new Date().toISOString().slice(0,10) + '.json';
+  a.download = 'catatan-pintar-' + new Date().toISOString().slice(0,10) + '.json';
   document.body.appendChild(a); a.click(); a.remove();
   URL.revokeObjectURL(url);
   toast("Semua catatan diunduh sebagai file .json");
@@ -929,6 +1145,78 @@ function importFile(file){
 }
 
 /* ============================================================
+   EDITOR HELPERS: pencatatan jejak tulisan, tugas, navigasi
+   ============================================================ */
+function onContentChanged(n){
+  const w = countWords(n.content);
+  const prev = n.wc == null ? w : n.wc;
+  const iso = nowISO();
+  n.history = n.history || [];
+  const last = n.history[n.history.length-1];
+  if(last && last.kind === 'edit' && Date.now() - new Date(last.until || last.at).getTime() < 10*60000){
+    last.until = iso; last.to = w;           // masih satu sesi menulis
+  } else {
+    n.history.push({at:iso, until:iso, kind:'edit', action:'Menulis', from:prev, to:w});
+  }
+  if(n.history.length > 300) n.history.splice(1, n.history.length-300);
+  n.wc = w; n.updatedAt = iso;
+  save(); updateEditorFoot(n); checkGoal();
+}
+function toggleTaskLine(id, line, checked){
+  const n = getNote(id); if(!n) return;
+  const lines = n.content.split('\n');
+  const text = (lines[line]||'').replace(/^\s*[-*]\s\[( |x|X)\]\s/,'');
+  lines[line] = lines[line].replace(/\[( |x|X)\]/, checked ? '[x]' : '[ ]');
+  n.content = lines.join('\n');
+  n.updatedAt = nowISO();
+  n.history = n.history || [];
+  n.history.push({at:n.updatedAt, kind:'task', action:(checked?'Menyelesaikan tugas: ':'Membuka kembali tugas: ')+text.slice(0,50)});
+  save();
+  if(checked){
+    const items = extractActionItemsFromContent(n.content);
+    if(items.length >= 2 && items.every(i=>i.done)){
+      SN.fx.confetti(); SN.fx.ding(); toast('Semua tugas di "'+(n.title||'catatan')+'" selesai! 🎉');
+    }
+  }
+}
+function updateEditorFoot(n){
+  const wc = document.getElementById('wc'); if(!wc) return;
+  const w = n.wc != null ? n.wc : countWords(n.content);
+  wc.textContent = w.toLocaleString('id-ID') + ' kata';
+  const ch = document.getElementById('chars'); if(ch) ch.textContent = (n.content||'').length.toLocaleString('id-ID') + ' karakter';
+  const m = activityMap(), k = dayKey(new Date()), goal = getGoal(), tw = m[k] ? m[k].words : 0;
+  const f = document.getElementById('goal-fill'); if(f) f.style.width = Math.min(100, tw/goal*100) + '%';
+  const t = document.getElementById('goal-txt'); if(t) t.textContent = 'Hari ini ' + tw + '/' + goal;
+}
+function goBack(){
+  const p = state.prev || {view:'all'};
+  state.view = p.view || 'all'; state.activeTag = p.tag || null; state.params = p.params || {};
+  state.currentNoteId = null;
+  if(state.view === 'tag' && !state.activeTag) state.view = 'all';
+  render();
+}
+function historyLabel(e){
+  if(e.kind === 'create') return {icon:'🌱', text:'Catatan dibuat'};
+  if(e.kind === 'edit'){
+    const d = (e.to||0) - (e.from||0);
+    return {icon:'✒', text: d>0 ? 'Menulis · +'+d+' kata' : d<0 ? 'Menyunting · '+d+' kata' : 'Menyunting'};
+  }
+  if(e.kind === 'task' || /tugas/i.test(e.action)) return {icon:'✅', text:e.action};
+  if(/trash/i.test(e.action)) return {icon:'🗑', text:e.action};
+  if(/analysis/i.test(e.action)) return {icon:'✨', text:e.action};
+  if(/link/i.test(e.action)) return {icon:'🔗', text:e.action};
+  return {icon:'•', text:e.action};
+}
+function renderHistory(note){
+  const h = (note.history||[]).slice().reverse().slice(0,40);
+  if(!h.length) return '<span class="verify-note">Belum ada riwayat</span>';
+  return '<div class="mini-tl">' + h.map(e=>{
+    const l = historyLabel(e);
+    return `<div class="mini-ev"><span class="ic">${l.icon}</span><div><strong>${fmtDate(e.at)}</strong><br>${escapeHtml(l.text)}</div></div>`;
+  }).join('') + `</div><button class="link-btn" data-action="see-jejak" data-id="${note.id}">Lihat di Jejak →</button>`;
+}
+
+/* ============================================================
    MODAL
    ============================================================ */
 function confirmModal(title, desc, onConfirm){
@@ -941,21 +1229,42 @@ function confirmModal(title, desc, onConfirm){
   wrap.querySelector('[data-x="ok"]').onclick = ()=>{ wrap.remove(); onConfirm(); };
   wrap.addEventListener('click', e=>{ if(e.target===wrap) wrap.remove(); });
 }
+function promptModal(title, desc, value, onOk){
+  const wrap = document.createElement('div');
+  wrap.className = 'modal-backdrop';
+  wrap.innerHTML = `<div class="modal"><h3>${escapeHtml(title)}</h3><p>${escapeHtml(desc)}</p>
+    <input class="modal-input" type="number" min="1" value="${escapeHtml(value)}" />
+    <div class="row"><button data-x="cancel">Batal</button><button class="primary" data-x="ok">Simpan</button></div></div>`;
+  document.body.appendChild(wrap);
+  const inp = wrap.querySelector('input'); inp.focus(); inp.select();
+  const ok = ()=>{ const v = inp.value; wrap.remove(); onOk(v); };
+  wrap.querySelector('[data-x="cancel"]').onclick = ()=>wrap.remove();
+  wrap.querySelector('[data-x="ok"]').onclick = ok;
+  inp.addEventListener('keydown', e=>{ if(e.key==='Enter') ok(); if(e.key==='Escape') wrap.remove(); });
+  wrap.addEventListener('click', e=>{ if(e.target===wrap) wrap.remove(); });
+}
 
 /* ============================================================
    GLOBAL UI EVENTS
    ============================================================ */
+let globalBound = false;
+function refreshToggleLabels(){
+  const s = document.getElementById('sound-btn'), i = document.getElementById('ink-btn');
+  if(s) s.textContent = SN.fx.soundEnabled() ? '🔊 Suara' : '🔇 Suara';
+  if(i) i.textContent = '✒ Jejak tinta: ' + (SN.fx.inkEnabled() ? 'aktif' : 'mati');
+}
 function bindGlobalEvents(){
+  if(globalBound) return; globalBound = true;
   document.querySelectorAll('.nav-item[data-view]').forEach(el=>{
     el.addEventListener('click', ()=>{
-      state.view = el.dataset.view; state.activeTag = null; state.currentNoteId=null;
+      state.view = el.dataset.view; state.activeTag = null; state.currentNoteId = null; state.params = {};
       render();
       document.getElementById('sidebar').classList.remove('open');
     });
   });
   document.getElementById('search-input').addEventListener('input', e=>{
     state.search = e.target.value;
-    if(state.view === 'editor') { state.view = 'all'; }
+    if(['editor','book','jejak'].includes(state.view)) state.view = 'all';
     render();
   });
   document.querySelector('[data-action="export"]').onclick = exportAll;
@@ -965,41 +1274,93 @@ function bindGlobalEvents(){
     e.target.value = '';
   });
   document.getElementById('theme-btn').onclick = toggleTheme;
+  document.getElementById('sound-btn').onclick = ()=>{ SN.fx.setSound(!SN.fx.soundEnabled()); refreshToggleLabels(); SN.fx.flip(); };
+  document.getElementById('ink-btn').onclick = ()=>{ SN.fx.setInk(!SN.fx.inkEnabled()); refreshToggleLabels(); };
+  document.querySelector('[data-action="logout"]').onclick = ()=>{
+    const pend = SN.pendingCount();
+    confirmModal("Keluar dari akun?", pend ? "Ada "+pend+" perubahan yang belum tersimpan ke Sheet. Salinannya tetap aman di perangkat ini." : "Catatanmu aman tersimpan. Kamu bisa masuk lagi kapan saja.", ()=>SN.auth.logout());
+  };
   document.querySelector('[data-action="toggle-sidebar"]').onclick = ()=>{
     document.getElementById('sidebar').classList.toggle('open');
   };
   document.addEventListener('click', e=>{
     const tagBtn = e.target.closest('[data-action="open-tag"]');
     if(tagBtn){ state.activeTag = tagBtn.dataset.tag; state.view='tag'; state.currentNoteId=null; render(); }
+    const sj = e.target.closest('[data-action="see-jejak"]');
+    if(sj){ SN.go('jejak',{noteId:sj.dataset.id}); }
   });
   document.addEventListener('keydown', e=>{
     if((e.ctrlKey || e.metaKey) && e.key.toLowerCase()==='k'){
       e.preventDefault();
       document.getElementById('search-input').focus();
     }
+    if(e.key === 'Escape' && document.body.classList.contains('focus')) document.body.classList.remove('focus');
   });
+  document.getElementById('focus-exit').onclick = ()=>document.body.classList.remove('focus');
+  addEventListener('online', ()=>{ if(SN.backend.remote) doSync(); });
+  document.addEventListener('visibilitychange', ()=>{ if(document.hidden && SN.backend.remote) doSync(); });
 }
 
 function toggleTheme(){
   const cur = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
   const next = cur === 'dark' ? 'light' : 'dark';
   document.documentElement.setAttribute('data-theme', next);
-  document.getElementById('theme-btn').textContent = next==='dark' ? '☀️ Mode terang' : '🌙 Mode gelap';
+  document.getElementById('theme-btn').textContent = next==='dark' ? '☀️ Terang' : '🌙 Gelap';
   try{ localStorage.setItem(THEME_KEY, next); }catch(e){}
 }
 function loadTheme(){
   let t = 'light';
   try{ t = localStorage.getItem(THEME_KEY) || 'light'; }catch(e){}
   document.documentElement.setAttribute('data-theme', t);
-  document.getElementById('theme-btn').textContent = t==='dark' ? '☀️ Mode terang' : '🌙 Mode gelap';
+  const b = document.getElementById('theme-btn'); if(b) b.textContent = t==='dark' ? '☀️ Terang' : '🌙 Gelap';
 }
+
+/* ============================================================
+   API PUBLIK (dipakai auth.js, book.js, jejak.js)
+   ============================================================ */
+SN.go = function(view, params){
+  state.view = view; state.params = params || {}; state.activeTag = null; state.currentNoteId = null;
+  render();
+};
+SN.start = function(user, server){
+  USER = user; SN.user = user;
+  let local = [];
+  try{ local = JSON.parse(localStorage.getItem(K.notes(user.username)) || '[]'); }catch(e){}
+  try{ pendingDel = JSON.parse(localStorage.getItem(K.pdel(user.username)) || '[]'); }catch(e){ pendingDel = []; }
+  notes = mergeNotes(local, server);
+  if(!notes.length && !localStorage.getItem(K.seeded(user.username)) && !(server && server.notes && server.notes.length)){
+    let legacy = null;
+    try{ legacy = JSON.parse(localStorage.getItem(LEGACY_KEY) || 'null'); }catch(e){}
+    if(Array.isArray(legacy) && legacy.length && !localStorage.getItem('sn_legacy_done')){
+      notes = legacy; try{ localStorage.setItem('sn_legacy_done','1'); }catch(e){}
+      toast(legacy.length + " catatan lama dari perangkat ini diimpor");
+    } else notes = seedData();
+    try{ localStorage.setItem(K.seeded(user.username),'1'); }catch(e){}
+  }
+  notes.forEach(n=>{ if(n.wc == null) n.wc = countWords(n.content); if(!n.history) n.history = []; });
+  state.view = 'dashboard'; state.search = '';
+  persistLocal();
+  document.getElementById('user-name').textContent = user.name;
+  document.getElementById('user-handle').textContent = '@' + user.username;
+  document.getElementById('user-avatar').textContent = (user.name || '?').trim().charAt(0).toUpperCase();
+  refreshToggleLabels();
+  bindGlobalEvents();
+  render();
+  if(server) scheduleSync(400); else if(!SN.backend.remote) setStatus('local'); else setStatus('pending');
+};
+
+Object.defineProperties(SN, {
+  notes: {get: ()=>notes}, state: {get: ()=>state}
+});
+Object.assign(SN, {
+  getNote, activeNotes, openNote, toast, escapeHtml, plainText, mdToHtml, fmtDate, fmtRelative,
+  dayKey, activityMap, heatmapHtml, countWords, render, confirmModal, getGoal, streakDays
+});
+Object.defineProperty(SN, 'userName', {get: ()=>USER && USER.name});
 
 /* ============================================================
    INIT
    ============================================================ */
 loadTheme();
-load();
-bindGlobalEvents();
-render();
 
 })();

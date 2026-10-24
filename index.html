@@ -3,17 +3,62 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>SmartNote AI</title>
+<title>Catatan Pintar</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@500;700&family=Kalam:wght@300;400&family=Lora:ital,wght@0,400;0,600;0,700;1,400&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-<div class="app" id="app">
 
-  <!-- SIDEBAR -->
+<canvas id="ink-canvas"></canvas>
+
+<!-- ===================== LAYAR MASUK ===================== -->
+<div class="auth" id="auth">
+  <div class="auth-bg" aria-hidden="true">
+    <span class="sheet s1"></span><span class="sheet s2"></span><span class="sheet s3"></span>
+    <span class="sheet s4"></span><span class="sheet s5"></span>
+    <i class="drop d1"></i><i class="drop d2"></i><i class="drop d3"></i><i class="drop d4"></i>
+  </div>
+
+  <div class="auth-card" id="auth-card">
+    <div class="sign-wrap">
+      <div class="sign" id="auth-sign">Catatan Pintar</div>
+      <span class="sign-quill" id="auth-quill"></span>
+    </div>
+    <p class="auth-sub">Tulis, simpan, dan telusuri jejak catatanmu.</p>
+
+    <div class="auth-tabs" role="tablist">
+      <button class="on" data-tab="login" type="button">Masuk</button>
+      <button data-tab="register" type="button">Daftar</button>
+      <i class="tab-ink"></i>
+    </div>
+
+    <form id="auth-form" autocomplete="on" novalidate>
+      <label class="fld reg-only"><span>Nama panggilan</span>
+        <input id="a-name" maxlength="40" placeholder="mis. Budi" autocomplete="nickname" /></label>
+      <label class="fld"><span>Username</span>
+        <input id="a-user" maxlength="24" placeholder="huruf kecil, angka, . atau _" autocomplete="username" autocapitalize="none" spellcheck="false" /></label>
+      <label class="fld"><span>Password</span>
+        <div class="pw"><input id="a-pass" type="password" placeholder="minimal 6 karakter" autocomplete="current-password" />
+        <button type="button" class="pw-eye" id="a-eye" aria-label="Tampilkan password">👁</button></div></label>
+      <label class="fld reg-only"><span>Ulangi password</span>
+        <input id="a-pass2" type="password" placeholder="ketik ulang password" autocomplete="new-password" /></label>
+      <div class="auth-err" id="auth-err" role="alert"></div>
+      <button class="auth-go" id="auth-go" type="submit"><span class="lbl">Masuk</span><span class="busy">Menulis…</span></button>
+    </form>
+    <div class="auth-mode" id="auth-mode"></div>
+  </div>
+</div>
+<div class="reveal-mask" id="reveal-mask"></div>
+
+<!-- ===================== APLIKASI ===================== -->
+<div class="app" id="app" hidden>
+
   <aside class="sidebar" id="sidebar">
     <div class="brand">
-      <div class="mark">S</div>
-      <div class="name">SmartNote<small>Asisten catatan pribadi</small></div>
+      <div class="mark">✒</div>
+      <div class="name">Catatan Pintar<small>Buku catatan pribadi</small></div>
     </div>
     <button class="new-note-btn" data-action="new-note">＋ Catatan Baru</button>
 
@@ -24,6 +69,14 @@
     <button class="nav-item" data-view="all">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h5"/></svg>
       Semua Catatan <span class="count" id="count-all">0</span>
+    </button>
+    <button class="nav-item" data-view="book">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M4 21V5M9 8h6M9 12h6"/></svg>
+      Buku Besar
+    </button>
+    <button class="nav-item" data-view="jejak">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="18" r="2"/><circle cx="12" cy="10" r="2"/><circle cx="18" cy="4" r="2"/><path d="M7.4 16.4 10.6 11.6M13.4 8.4 16.6 5.6" stroke-dasharray="2 2"/></svg>
+      Jejak
     </button>
     <button class="nav-item" data-view="favorites">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 17.3 6.2 21l1.5-6.6L2 9.9l6.7-.6L12 3l3.3 6.3 6.7.6-5.7 4.5 1.5 6.6z"/></svg>
@@ -42,35 +95,48 @@
     <div class="tag-nav" id="tag-nav"></div>
 
     <div class="sidebar-footer">
+      <div class="user-chip">
+        <div class="avatar" id="user-avatar">?</div>
+        <div class="u-meta"><b id="user-name">—</b><small id="user-handle"></small></div>
+        <button class="u-out" data-action="logout" title="Keluar dari akun">Keluar</button>
+      </div>
       <div class="row"><span>Catatan</span><span id="foot-count">0</span></div>
       <div class="row"><span>Ukuran data</span><span id="foot-size">0 KB</span></div>
-      <button data-action="export">⬇ Export semua (.json)</button>
-      <button data-action="import">⬆ Import dari file</button>
+      <div class="foot-grid">
+        <button data-action="export" title="Unduh cadangan .json">⬇ Ekspor</button>
+        <button data-action="import" title="Impor dari file .json">⬆ Impor</button>
+        <button data-action="toggle-theme" id="theme-btn">🌙 Gelap</button>
+        <button data-action="toggle-sound" id="sound-btn">🔇 Suara</button>
+        <button data-action="toggle-ink" id="ink-btn" class="wide">✒ Jejak tinta: aktif</button>
+      </div>
       <input type="file" id="import-input" accept="application/json" />
-      <button data-action="toggle-theme" id="theme-btn">🌙 Mode gelap</button>
     </div>
   </aside>
 
-  <!-- MAIN -->
   <div class="main">
     <div class="topbar">
       <button class="menu-btn icon-btn" data-action="toggle-sidebar">☰</button>
       <div class="search-box">
-        🔎 <input id="search-input" placeholder="Cari catatan, topik, tag, atau kata kunci..." />
+        🔎 <input id="search-input" placeholder="Cari catatan, topik, tag… (Ctrl+K)" />
       </div>
       <div class="topbar-actions">
-        <button class="icon-btn" data-action="toggle-sidebar" title="Sidebar" style="display:none"></button>
+        <span class="sync-pill" id="sync-pill" data-s="local">💾 Mode lokal</span>
       </div>
     </div>
-
-    <div class="content">
+    <div class="content" id="content">
       <div class="content-inner" id="view-root"></div>
     </div>
   </div>
 </div>
 
+<button class="focus-exit" id="focus-exit" hidden>Keluar mode fokus (Esc)</button>
 <div class="toast-wrap" id="toast-wrap"></div>
 
+<script src="config.js"></script>
+<script src="cursor.js"></script>
 <script src="script.js"></script>
+<script src="book.js"></script>
+<script src="jejak.js"></script>
+<script src="auth.js"></script>
 </body>
 </html>
